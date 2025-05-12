@@ -379,3 +379,130 @@
         (ok true)
     )
 )
+
+
+(define-constant INSPECTION-PASS u1)
+(define-constant INSPECTION-FAIL u2)
+(define-constant INSPECTION-PENDING u3)
+
+(define-map authorized-inspectors 
+    principal 
+    { active: bool, certification-id: (string-ascii 50) }
+)
+
+(define-map inspection-reports
+    { batch-id: uint, report-id: uint }
+    { 
+        inspector: principal,
+        timestamp: uint,
+        temperature: int,
+        humidity: uint,
+        contamination-check: bool,
+        status: uint,
+        notes: (string-ascii 200)
+    }
+)
+
+(define-data-var next-report-id uint u1)
+
+(define-public (register-inspector (certification-id (string-ascii 50)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set authorized-inspectors tx-sender {
+            active: true,
+            certification-id: certification-id
+        })
+        (ok true)
+    )
+)
+
+(define-public (submit-inspection-report
+    (batch-id uint)
+    (temperature int)
+    (humidity uint)
+    (contamination-check bool)
+    (status uint)
+    (notes (string-ascii 200)))
+    (let ((report-id (var-get next-report-id))
+          (inspector-info (unwrap! (map-get? authorized-inspectors tx-sender) err-not-found)))
+        (asserts! (get active inspector-info) (err u110))
+        (map-set inspection-reports
+            { batch-id: batch-id, report-id: report-id }
+            {
+                inspector: tx-sender,
+                timestamp: stacks-block-height,
+                temperature: temperature,
+                humidity: humidity,
+                contamination-check: contamination-check,
+                status: status,
+                notes: notes
+            })
+        (var-set next-report-id (+ report-id u1))
+        (ok report-id)
+    )
+)
+
+
+(define-constant DISTRIBUTOR-ROLE u1)
+(define-constant WHOLESALER-ROLE u2)
+(define-constant RETAILER-ROLE u3)
+
+(define-map distribution-chain
+    { batch-id: uint, step-id: uint }
+    {
+        handler: principal,
+        role: uint,
+        location: (string-ascii 50),
+        timestamp: uint,
+        temperature: int,
+        handling-notes: (string-ascii 100)
+    }
+)
+
+(define-data-var next-step-id uint u1)
+
+(define-map authorized-handlers
+    principal
+    { role: uint, active: bool }
+)
+
+(define-public (register-handler (handler principal) (role uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set authorized-handlers handler {
+            role: role,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (record-distribution-step
+    (batch-id uint)
+    (location (string-ascii 50))
+    (temperature int)
+    (handling-notes (string-ascii 100)))
+    (let ((step-id (var-get next-step-id))
+          (handler-info (unwrap! (map-get? authorized-handlers tx-sender) err-not-found)))
+        (asserts! (get active handler-info) (err u112))
+        (map-set distribution-chain
+            { batch-id: batch-id, step-id: step-id }
+            {
+                handler: tx-sender,
+                role: (get role handler-info),
+                location: location,
+                timestamp: stacks-block-height,
+                temperature: temperature,
+                handling-notes: handling-notes
+            })
+        (var-set next-step-id (+ step-id u1))
+        (ok step-id)
+    )
+)
+
+
+(define-public (get-distribution-history (batch-id uint))
+    (let ((history (map-get? distribution-chain { batch-id: batch-id, step-id: u0 })))
+        (ok history)
+    )
+)
