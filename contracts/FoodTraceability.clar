@@ -506,3 +506,192 @@
         (ok history)
     )
 )
+
+(define-constant COMPLAINT-OPEN u1)
+(define-constant COMPLAINT-INVESTIGATING u2)
+(define-constant COMPLAINT-RESOLVED u3)
+(define-constant COMPLAINT-REJECTED u4)
+
+(define-constant SEVERITY-LOW u1)
+(define-constant SEVERITY-MEDIUM u2)
+(define-constant SEVERITY-HIGH u3)
+(define-constant SEVERITY-CRITICAL u4)
+
+(define-data-var next-complaint-id uint u1)
+
+(define-map consumer-complaints
+    uint
+    {
+        batch-id: uint,
+        consumer: principal,
+        complaint-type: (string-ascii 50),
+        description: (string-ascii 300),
+        severity: uint,
+        status: uint,
+        filed-date: uint,
+        resolution-date: (optional uint),
+        resolution-notes: (string-ascii 200),
+        resolver: (optional principal)
+    }
+)
+
+(define-map producer-reputation
+    principal
+    {
+        total-complaints: uint,
+        resolved-complaints: uint,
+        average-resolution-time: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map complaint-evidence
+    { complaint-id: uint, evidence-id: uint }
+    {
+        evidence-type: (string-ascii 30),
+        evidence-hash: (string-ascii 64),
+        description: (string-ascii 100),
+        uploaded-date: uint
+    }
+)
+
+(define-data-var next-evidence-id uint u1)
+
+(define-public (file-complaint
+    (batch-id uint)
+    (complaint-type (string-ascii 50))
+    (description (string-ascii 300))
+    (severity uint))
+    (let ((complaint-id (var-get next-complaint-id))
+          (batch (unwrap! (map-get? food-batches batch-id) err-not-found)))
+        (asserts! (>= severity SEVERITY-LOW) (err u113))
+        (asserts! (<= severity SEVERITY-CRITICAL) (err u114))
+        (map-set consumer-complaints complaint-id
+            {
+                batch-id: batch-id,
+                consumer: tx-sender,
+                complaint-type: complaint-type,
+                description: description,
+                severity: severity,
+                status: COMPLAINT-OPEN,
+                filed-date: stacks-block-height,
+                resolution-date: none,
+                resolution-notes: "",
+                resolver: none
+            })
+        (unwrap! (update-producer-complaint-count (get producer batch)) (err u117))
+        (var-set next-complaint-id (+ complaint-id u1))
+        (ok complaint-id)
+    )
+)
+
+(define-public (update-complaint-status
+    (complaint-id uint)
+    (new-status uint)
+    (resolution-notes (string-ascii 200)))
+    (let ((complaint (unwrap! (map-get? consumer-complaints complaint-id) err-not-found))
+          (batch (unwrap! (map-get? food-batches (get batch-id complaint)) err-not-found)))
+        (asserts! (or (is-eq tx-sender contract-owner) 
+                     (is-eq tx-sender (get producer batch))) err-owner-only)
+        (asserts! (>= new-status COMPLAINT-OPEN) (err u115))
+        (asserts! (<= new-status COMPLAINT-REJECTED) (err u116))
+        (map-set consumer-complaints complaint-id
+            (merge complaint {
+                status: new-status,
+                resolution-date: (if (or (is-eq new-status COMPLAINT-RESOLVED)
+                                        (is-eq new-status COMPLAINT-REJECTED))
+                                    (some stacks-block-height)
+                                    none),
+                resolution-notes: resolution-notes,
+                resolver: (some tx-sender)
+            }))
+        (if (is-eq new-status COMPLAINT-RESOLVED)
+            (update-producer-resolved-count (get producer batch))
+            (ok true))
+    )
+)
+
+(define-public (add-complaint-evidence
+    (complaint-id uint)
+    (evidence-type (string-ascii 30))
+    (evidence-hash (string-ascii 64))
+    (description (string-ascii 100)))
+    (let ((complaint (unwrap! (map-get? consumer-complaints complaint-id) err-not-found))
+          (evidence-id (var-get next-evidence-id)))
+        (asserts! (is-eq tx-sender (get consumer complaint)) err-owner-only)
+        (map-set complaint-evidence
+            { complaint-id: complaint-id, evidence-id: evidence-id }
+            {
+                evidence-type: evidence-type,
+                evidence-hash: evidence-hash,
+                description: description,
+                uploaded-date: stacks-block-height
+            })
+        (var-set next-evidence-id (+ evidence-id u1))
+        (ok evidence-id)
+    )
+)
+
+(define-private (update-producer-complaint-count (producer principal))
+    (let ((current-rep (default-to 
+                        { total-complaints: u0, resolved-complaints: u0, 
+                          average-resolution-time: u0, reputation-score: u100 }
+                        (map-get? producer-reputation producer))))
+        (map-set producer-reputation producer
+            (merge current-rep {
+                total-complaints: (+ (get total-complaints current-rep) u1),
+                reputation-score: (calculate-reputation-score 
+                                  (+ (get total-complaints current-rep) u1)
+                                  (get resolved-complaints current-rep))
+            }))
+        (ok true)
+    )
+)
+
+(define-private (update-producer-resolved-count (producer principal))
+    (let ((current-rep (unwrap! (map-get? producer-reputation producer) err-not-found)))
+        (map-set producer-reputation producer
+            (merge current-rep {
+                resolved-complaints: (+ (get resolved-complaints current-rep) u1),
+                reputation-score: (calculate-reputation-score 
+                                  (get total-complaints current-rep)
+                                  (+ (get resolved-complaints current-rep) u1))
+            }))
+        (ok true)
+    )
+)
+
+(define-private (calculate-reputation-score (total uint) (resolved uint))
+    (if (is-eq total u0)
+        u100
+        (/ (* resolved u100) total)
+    )
+)
+
+(define-read-only (get-complaint-details (complaint-id uint))
+    (map-get? consumer-complaints complaint-id)
+)
+
+(define-read-only (get-producer-reputation (producer principal))
+    (map-get? producer-reputation producer)
+)
+
+(define-read-only (get-complaint-evidence (complaint-id uint) (evidence-id uint))
+    (map-get? complaint-evidence { complaint-id: complaint-id, evidence-id: evidence-id })
+)
+
+(define-read-only (get-batch-complaints-count (batch-id uint))
+    (let ((batch (unwrap! (map-get? food-batches batch-id) err-not-found)))
+        (match (map-get? producer-reputation (get producer batch))
+            rep (ok (get total-complaints rep))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (is-producer-reliable (producer principal))
+    (match (map-get? producer-reputation producer)
+        rep (>= (get reputation-score rep) u80)
+        true
+    )
+)
